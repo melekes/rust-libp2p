@@ -65,6 +65,7 @@ websocket = ["dep:libp2p-websocket"]
 yamux = ["dep:libp2p-yamux"]
 secp256k1 = ["libp2p-core/secp256k1"]
 serde = ["libp2p-core/serde", "libp2p-kad?/serde", "libp2p-gossipsub?/serde"]
+webrtc = ["dep:libp2p-webrtc"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -97,7 +98,8 @@ libp2p-swarm-derive = { version = "0.28.0", path = "swarm-derive" }
 libp2p-uds = { version = "0.33.0", path = "transports/uds", optional = true }
 libp2p-wasm-ext = { version = "0.34.0", path = "transports/wasm-ext", default-features = false, optional = true }
 libp2p-yamux = { version = "0.38.0", path = "muxers/yamux", optional = true }
-multiaddr = { version = "0.14.0" }
+libp2p-webrtc = { version = "0.1.0", path = "transports/webrtc", optional = true }
+multiaddr = { version = "0.15.0" }
 parking_lot = "0.12.0"
 pin-project = "1.0.0"
 rand = "0.7.3" # Explicit dependency to be used in `wasm-bindgen` feature
@@ -112,6 +114,10 @@ libp2p-websocket = { version = "0.36.0", path = "transports/websocket", optional
 
 [target.'cfg(not(target_os = "unknown"))'.dependencies]
 libp2p-gossipsub = { version = "0.39.0", path = "protocols/gossipsub", optional = true }
+
+[patch.crates-io]
+# TODO: remove once a new version of rust-multiaddr is released
+multiaddr = { version = "0.15.0", git = "https://github.com/multiformats/rust-multiaddr.git", branch = "master" }
 
 [dev-dependencies]
 async-std = { version = "1.6.2", features = ["attributes"] }
@@ -151,7 +157,8 @@ members = [
     "transports/tcp",
     "transports/uds",
     "transports/websocket",
-    "transports/wasm-ext"
+    "transports/wasm-ext",
+    "transports/webrtc"
 ]
 
 [[example]]

@@ -1,0 +1,39 @@
+[package]
+name = "libp2p-webrtc"
+version = "0.1.0"
+authors = ["Parity Technologies <admin@parity.io>"]
+description = "WebRTC transport for libp2p"
+repository = "https://github.com/libp2p/rust-libp2p"
+license = "MIT"
+edition = "2021"
+keywords = ["peer-to-peer", "libp2p", "networking"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+fnv = "1.0"
+futures = "0.3"
+futures-lite = "1"
+futures-timer = "3"
+hex = "0.4"
+if-watch = "2.0"
+libp2p-core = { version = "0.35.0", path = "../../core", default-features = false  }
+libp2p-noise = { version = "0.38.0", path = "../../transports/noise" }
+log = "0.4"
+multihash = { version = "0.16", default-features = false, features = ["sha2"] }
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+stun = "0.4"
+thiserror = "1"
+tinytemplate = "1.2"
+tokio-crate = { package = "tokio", version = "1.18", features = ["net"]}
+webrtc = "0.5.0"
+
+[dev-dependencies]
+anyhow = "1.0"
+env_logger = "0.9"
+libp2p = { path = "../..", features = ["request-response"], default-features = false }
+rand_core = "0.5"
+rcgen = "0.9"
+quickcheck = "1"

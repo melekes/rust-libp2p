@@ -29,7 +29,7 @@ use stun::{
 use tokio::{io::ReadBuf, net::UdpSocket};
 use tokio_crate as tokio;
 use webrtc_ice::udp_mux::{UDPMux, UDPMuxConn, UDPMuxConnParams, UDPMuxWriter};
-use webrtc_util::{sync::RwLock, Conn, Error};
+use webrtc_util::{Conn, Error};
 
 use flume::TryRecvError;
 use futures::channel::oneshot;
@@ -39,7 +39,7 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     task::{Context, Poll},
 };
@@ -106,8 +106,8 @@ impl UDPMuxNewAddr {
                 remove_sender: todo!(),
             }),
             udp_mux_writer_handle: Arc::new(UdpMuxWriterHandle {
-                registration_channel: futures::lock::Mutex::new(registration_sender),
-                send_channel: futures::lock::Mutex::new(send_sender),
+                registration_channel: registration_sender,
+                send_channel: send_sender,
             }),
         }
     }
@@ -255,14 +255,12 @@ fn write_packet_to_conn_from_addr(conn: UDPMuxConn, packet: Vec<u8>, addr: Socke
 }
 
 pub struct UdpMuxHandle {
-    close_sender: futures::lock::Mutex<flume::Sender<oneshot::Sender<Result<(), Error>>>>,
-    get_conn_sender: futures::lock::Mutex<
-        flume::Sender<(
-            String,
-            oneshot::Sender<Result<Arc<dyn Conn + Send + Sync>, Error>>,
-        )>,
-    >,
-    remove_sender: futures::lock::Mutex<flume::Sender<(String)>>,
+    close_sender: flume::Sender<oneshot::Sender<Result<(), Error>>>,
+    get_conn_sender: flume::Sender<(
+        String,
+        oneshot::Sender<Result<Arc<dyn Conn + Send + Sync>, Error>>,
+    )>,
+    remove_sender: flume::Sender<String>,
 }
 
 #[async_trait]
@@ -271,9 +269,8 @@ impl UDPMux for UdpMuxHandle {
         let (response_sender, response_receiver) = oneshot::channel();
 
         self.close_sender
-            .lock()
+            .send_async(response_sender)
             .await
-            .send(response_sender)
             .expect("TODO");
 
         response_receiver.await.expect("TODO")
@@ -283,9 +280,8 @@ impl UDPMux for UdpMuxHandle {
         let (response_sender, response_receiver) = oneshot::channel();
 
         self.get_conn_sender
-            .lock()
+            .send_async((ufrag.to_owned(), response_sender))
             .await
-            .send((ufrag.to_owned(), response_sender))
             .expect("TODO");
 
         response_receiver.await.expect("TODO")
@@ -293,9 +289,8 @@ impl UDPMux for UdpMuxHandle {
 
     async fn remove_conn_by_ufrag(&self, ufrag: &str) {
         self.remove_sender
-            .lock()
+            .send_async(ufrag.to_owned())
             .await
-            .send(ufrag.to_owned())
             .expect("TODO")
     }
 }
@@ -386,12 +381,9 @@ impl UDPMux for UdpMuxHandle {
 //     }
 // }
 
-// We only use Mutexes here because the interface forces us into `&self`.
 pub struct UdpMuxWriterHandle {
-    registration_channel: futures::lock::Mutex<flume::Sender<(UDPMuxConn, SocketAddr)>>,
-    send_channel: futures::lock::Mutex<
-        flume::Sender<(Vec<u8>, SocketAddr, oneshot::Sender<Result<usize, Error>>)>,
-    >,
+    registration_channel: flume::Sender<(UDPMuxConn, SocketAddr)>,
+    send_channel: flume::Sender<(Vec<u8>, SocketAddr, oneshot::Sender<Result<usize, Error>>)>,
 }
 
 #[async_trait]
@@ -399,9 +391,8 @@ impl UDPMuxWriter for UdpMuxWriterHandle {
     async fn register_conn_for_address(&self, conn: &UDPMuxConn, addr: SocketAddr) {
         match self
             .registration_channel
-            .lock()
+            .send_async((conn.to_owned(), addr))
             .await
-            .send((conn.to_owned(), addr))
         {
             Ok(()) => {}
             Err(flume::SendError(_unsent_item)) => {
@@ -416,9 +407,8 @@ impl UDPMuxWriter for UdpMuxWriterHandle {
         let (response_sender, response_receiver) = oneshot::channel();
 
         self.send_channel
-            .lock()
+            .send_async((buf.to_owned(), target.to_owned(), response_sender))
             .await
-            .send((buf.to_owned(), target.to_owned(), response_sender))
             .expect("TODO");
 
         response_receiver.await.expect("TODO")

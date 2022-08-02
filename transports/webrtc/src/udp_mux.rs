@@ -31,13 +31,15 @@ use tokio_crate as tokio;
 use webrtc_ice::udp_mux::{UDPMux, UDPMuxConn, UDPMuxConnParams, UDPMuxWriter};
 use webrtc_util::{sync::RwLock, Conn, Error};
 
+use flume::TryRecvError;
+use futures::channel::oneshot;
 use std::{
     collections::{HashMap, HashSet},
     io::ErrorKind,
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, Weak,
+        Arc, Mutex,
     },
     task::{Context, Poll},
 };
@@ -66,51 +68,78 @@ pub struct UDPMuxNewAddr {
     udp_sock: UdpSocket,
 
     /// Maps from ufrag to the underlying connection.
-    conns: Mutex<HashMap<String, UDPMuxConn>>,
+    conns: HashMap<String, UDPMuxConn>,
 
     /// Maps from socket address to the underlying connection.
-    address_map: RwLock<HashMap<SocketAddr, UDPMuxConn>>,
+    address_map: HashMap<SocketAddr, UDPMuxConn>,
 
     /// Set of the new addresses to avoid sending the same address multiple times.
-    new_addrs: RwLock<HashSet<SocketAddr>>,
+    new_addrs: HashSet<SocketAddr>,
 
     /// `true` when UDP mux is closed.
     is_closed: AtomicBool,
+
+    registration_receiver: flume::Receiver<(UDPMuxConn, SocketAddr)>,
+    send_receiver: flume::Receiver<(Vec<u8>, SocketAddr, oneshot::Sender<Result<usize, Error>>)>,
+
+    udp_mux_handle: Arc<UdpMuxHandle>,
+    udp_mux_writer_handle: Arc<UdpMuxWriterHandle>,
 }
 
 impl UDPMuxNewAddr {
     /// Creates a new UDP muxer.
-    pub fn new(udp_sock: UdpSocket) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(udp_sock: UdpSocket) -> Self {
+        let (registration_sender, registration_receiver) = flume::bounded(0); // 0 capacity creates a rendezvous channel.
+        let (send_sender, send_receiver) = flume::bounded(0); // 0 capacity creates a rendezvous channel.
+
+        Self {
             udp_sock,
-            conns: Mutex::default(),
-            address_map: RwLock::default(),
-            new_addrs: RwLock::default(),
+            conns: HashMap::default(),
+            address_map: HashMap::default(),
+            new_addrs: HashSet::default(),
             is_closed: AtomicBool::new(false),
-        })
+            registration_receiver,
+            send_receiver,
+            udp_mux_handle: Arc::new(UdpMuxHandle {
+                close_sender: todo!(),
+                get_conn_sender: todo!(),
+                remove_sender: todo!(),
+            }),
+            udp_mux_writer_handle: Arc::new(UdpMuxWriterHandle {
+                registration_channel: futures::lock::Mutex::new(registration_sender),
+                send_channel: futures::lock::Mutex::new(send_sender),
+            }),
+        }
+    }
+
+    pub fn udp_mux_handle(&self) -> Arc<UdpMuxHandle> {
+        self.udp_mux_handle.clone()
+    }
+
+    pub fn udp_mux_writer_handle(&self) -> Arc<UdpMuxWriterHandle> {
+        self.udp_mux_writer_handle.clone()
     }
 
     /// Create a muxed connection for a given ufrag.
     fn create_muxed_conn(self: &Arc<Self>, ufrag: &str) -> Result<UDPMuxConn, Error> {
-        let local_addr = self.udp_sock.local_addr()?;
+        // let local_addr = self.udp_sock.local_addr()?;
+        //
+        // let params = UDPMuxConnParams {
+        //     local_addr,
+        //     key: ufrag.into(),
+        //     udp_mux: Arc::downgrade(self) as Weak<dyn UDPMuxWriter + Sync + Send>,
+        // };
+        //
+        // Ok(UDPMuxConn::new(params))
 
-        let params = UDPMuxConnParams {
-            local_addr,
-            key: ufrag.into(),
-            udp_mux: Arc::downgrade(self) as Weak<dyn UDPMuxWriter + Sync + Send>,
-        };
-
-        Ok(UDPMuxConn::new(params))
+        todo!()
     }
 
     /// Returns a muxed connection if the `ufrag` from the given STUN message matches an existing
     /// connection.
     fn conn_from_stun_message(&self, buffer: &[u8], addr: &SocketAddr) -> Option<UDPMuxConn> {
         match ufrag_from_stun_message(buffer, true) {
-            Ok(ufrag) => {
-                let conns = self.conns.lock().unwrap();
-                conns.get(&ufrag).map(Clone::clone)
-            }
+            Ok(ufrag) => self.conns.get(&ufrag).map(Clone::clone),
             Err(e) => {
                 log::debug!("{} (addr={})", e, addr);
                 None
@@ -125,19 +154,44 @@ impl UDPMuxNewAddr {
 
     /// Reads from the underlying UDP socket and either reports a new address or proxies data to the
     /// muxed connection.
-    pub fn poll(&self, cx: &mut Context) -> Poll<UDPMuxEvent> {
+    pub fn poll(&mut self, cx: &mut Context) -> Poll<UDPMuxEvent> {
         // TODO: avoid allocating the buffer each time.
         let mut recv_buf = [0u8; RECEIVE_MTU];
         let mut read = ReadBuf::new(&mut recv_buf);
 
         loop {
+            {
+                match self.registration_receiver.try_recv() {
+                    Ok((conn, addr)) => {
+                        let key = conn.key();
+
+                        self.address_map
+                            .entry(addr)
+                            .and_modify(|e| {
+                                if e.key() != key {
+                                    e.remove_address(&addr);
+                                    *e = conn.clone();
+                                }
+                            })
+                            .or_insert_with(|| conn.clone());
+
+                        // remove addr from new_addrs once conn is established
+                        self.new_addrs.remove(&addr);
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        return Poll::Ready(UDPMuxEvent::Error(std::io::Error::new(
+                            ErrorKind::Other,
+                            "All senders dropped",
+                        )))
+                    }
+                }
+            }
+
             match ready!(self.udp_sock.poll_recv_from(cx, &mut read)) {
                 Ok(addr) => {
                     // Find connection based on previously having seen this source address
-                    let conn = {
-                        let address_map = self.address_map.read();
-                        address_map.get(&addr).map(Clone::clone)
-                    };
+                    let conn = self.address_map.get(&addr);
 
                     let conn = match conn {
                         // If we couldn't find the connection based on source address, see if
@@ -145,13 +199,13 @@ impl UDPMuxNewAddr {
                         None if is_stun_message(read.filled()) => {
                             self.conn_from_stun_message(&read.filled(), &addr)
                         }
-                        s @ Some(_) => s,
+                        Some(s) => Some(s.to_owned()),
                         _ => None,
                     };
 
                     match conn {
                         None => {
-                            if !self.new_addrs.read().contains(&addr) {
+                            if !self.new_addrs.contains(&addr) {
                                 match ufrag_from_stun_message(read.filled(), false) {
                                     Ok(ufrag) => {
                                         log::trace!(
@@ -159,8 +213,7 @@ impl UDPMuxNewAddr {
                                             &addr,
                                             ufrag
                                         );
-                                        let mut new_addrs = self.new_addrs.write();
-                                        new_addrs.insert(addr);
+                                        self.new_addrs.insert(addr);
                                         return Poll::Ready(UDPMuxEvent::NewAddr(NewAddr {
                                             addr,
                                             ufrag,
@@ -201,128 +254,174 @@ fn write_packet_to_conn_from_addr(conn: UDPMuxConn, packet: Vec<u8>, addr: Socke
     });
 }
 
-#[async_trait]
-impl UDPMux for UDPMuxNewAddr {
-    async fn close(&self) -> Result<(), Error> {
-        if self.is_closed() {
-            return Err(Error::ErrAlreadyClosed);
-        }
-
-        let old_conns = {
-            let mut conns = self.conns.lock().unwrap();
-
-            std::mem::take(&mut (*conns))
-        };
-
-        // NOTE: We don't wait for these closure to complete
-        for (_, conn) in old_conns {
-            conn.close();
-        }
-
-        {
-            let mut address_map = self.address_map.write();
-
-            // NOTE: This is important, we need to drop all instances of `UDPMuxConn` to
-            // avoid a retain cycle due to the use of [`std::sync::Arc`] on both sides.
-            let _ = std::mem::take(&mut (*address_map));
-        }
-
-        {
-            let mut new_addrs = self.new_addrs.write();
-
-            // NOTE: This is important, we need to drop all instances of `UDPMuxConn` to
-            // avoid a retain cycle due to the use of [`std::sync::Arc`] on both sides.
-            let _ = std::mem::take(&mut (*new_addrs));
-        }
-
-        Ok(())
-    }
-
-    async fn get_conn(self: Arc<Self>, ufrag: &str) -> Result<Arc<dyn Conn + Send + Sync>, Error> {
-        if self.is_closed() {
-            return Err(Error::ErrUseClosedNetworkConn);
-        }
-
-        {
-            let mut conns = self.conns.lock().unwrap();
-            if let Some(conn) = conns.get(ufrag) {
-                // UDPMuxConn uses `Arc` internally so it's cheap to clone, but because
-                // we implement `Conn` we need to further wrap it in an `Arc` here.
-                return Ok(Arc::new(conn.clone()) as Arc<dyn Conn + Send + Sync>);
-            }
-
-            let muxed_conn = self.create_muxed_conn(ufrag)?;
-            let mut close_rx = muxed_conn.close_rx();
-            let cloned_self = Arc::clone(&self);
-            let cloned_ufrag = ufrag.to_string();
-            tokio::spawn(async move {
-                let _ = close_rx.changed().await;
-
-                // Arc needed
-                cloned_self.remove_conn_by_ufrag(&cloned_ufrag).await;
-            });
-
-            conns.insert(ufrag.into(), muxed_conn.clone());
-
-            Ok(Arc::new(muxed_conn) as Arc<dyn Conn + Send + Sync>)
-        }
-    }
-
-    async fn remove_conn_by_ufrag(&self, ufrag: &str) {
-        // Pion's ice implementation has both `RemoveConnByFrag` and `RemoveConn`, but since `conns`
-        // is keyed on `ufrag` their implementation is equivalent.
-
-        let removed_conn = {
-            let mut conns = self.conns.lock().unwrap();
-            conns.remove(ufrag)
-        };
-
-        if let Some(conn) = removed_conn {
-            let mut address_map = self.address_map.write();
-
-            for address in conn.get_addresses() {
-                address_map.remove(&address);
-            }
-        }
-    }
+pub struct UdpMuxHandle {
+    close_sender: futures::lock::Mutex<flume::Sender<oneshot::Sender<Result<(), Error>>>>,
+    get_conn_sender: futures::lock::Mutex<
+        flume::Sender<(
+            String,
+            oneshot::Sender<Result<Arc<dyn Conn + Send + Sync>, Error>>,
+        )>,
+    >,
+    remove_sender: futures::lock::Mutex<flume::Sender<(String)>>,
 }
 
 #[async_trait]
-impl UDPMuxWriter for UDPMuxNewAddr {
+impl UDPMux for UdpMuxHandle {
+    async fn close(&self) -> Result<(), Error> {
+        let (response_sender, response_receiver) = oneshot::channel();
+
+        self.close_sender
+            .lock()
+            .await
+            .send(response_sender)
+            .expect("TODO");
+
+        response_receiver.await.expect("TODO")
+    }
+
+    async fn get_conn(self: Arc<Self>, ufrag: &str) -> Result<Arc<dyn Conn + Send + Sync>, Error> {
+        let (response_sender, response_receiver) = oneshot::channel();
+
+        self.get_conn_sender
+            .lock()
+            .await
+            .send((ufrag.to_owned(), response_sender))
+            .expect("TODO");
+
+        response_receiver.await.expect("TODO")
+    }
+
+    async fn remove_conn_by_ufrag(&self, ufrag: &str) {
+        self.remove_sender
+            .lock()
+            .await
+            .send(ufrag.to_owned())
+            .expect("TODO")
+    }
+}
+
+// #[async_trait]
+// impl UDPMux for UDPMuxNewAddr {
+//     async fn close(&self) -> Result<(), Error> {
+//         if self.is_closed() {
+//             return Err(Error::ErrAlreadyClosed);
+//         }
+//
+//         let old_conns = {
+//             let mut conns = self.conns.lock().unwrap();
+//
+//             std::mem::take(&mut (*conns))
+//         };
+//
+//         // NOTE: We don't wait for these closure to complete
+//         for (_, conn) in old_conns {
+//             conn.close();
+//         }
+//
+//         {
+//             let mut address_map = self.address_map.write();
+//
+//             // NOTE: This is important, we need to drop all instances of `UDPMuxConn` to
+//             // avoid a retain cycle due to the use of [`std::sync::Arc`] on both sides.
+//             let _ = std::mem::take(&mut (*address_map));
+//         }
+//
+//         {
+//             let mut new_addrs = self.new_addrs.write();
+//
+//             // NOTE: This is important, we need to drop all instances of `UDPMuxConn` to
+//             // avoid a retain cycle due to the use of [`std::sync::Arc`] on both sides.
+//             let _ = std::mem::take(&mut (*new_addrs));
+//         }
+//
+//         Ok(())
+//     }
+//
+//     async fn get_conn(self: Arc<Self>, ufrag: &str) -> Result<Arc<dyn Conn + Send + Sync>, Error> {
+//         if self.is_closed() {
+//             return Err(Error::ErrUseClosedNetworkConn);
+//         }
+//
+//         {
+//             let mut conns = self.conns.lock().unwrap();
+//             if let Some(conn) = conns.get(ufrag) {
+//                 // UDPMuxConn uses `Arc` internally so it's cheap to clone, but because
+//                 // we implement `Conn` we need to further wrap it in an `Arc` here.
+//                 return Ok(Arc::new(conn.clone()) as Arc<dyn Conn + Send + Sync>);
+//             }
+//
+//             let muxed_conn = self.create_muxed_conn(ufrag)?;
+//             let mut close_rx = muxed_conn.close_rx();
+//             let cloned_self = Arc::clone(&self);
+//             let cloned_ufrag = ufrag.to_string();
+//             tokio::spawn(async move {
+//                 let _ = close_rx.changed().await;
+//
+//                 // Arc needed
+//                 cloned_self.remove_conn_by_ufrag(&cloned_ufrag).await;
+//             });
+//
+//             conns.insert(ufrag.into(), muxed_conn.clone());
+//
+//             Ok(Arc::new(muxed_conn) as Arc<dyn Conn + Send + Sync>)
+//         }
+//     }
+//
+//     async fn remove_conn_by_ufrag(&self, ufrag: &str) {
+//         // Pion's ice implementation has both `RemoveConnByFrag` and `RemoveConn`, but since `conns`
+//         // is keyed on `ufrag` their implementation is equivalent.
+//
+//         let removed_conn = {
+//             let mut conns = self.conns.lock().unwrap();
+//             conns.remove(ufrag)
+//         };
+//
+//         if let Some(conn) = removed_conn {
+//             let mut address_map = self.address_map.write();
+//
+//             for address in conn.get_addresses() {
+//                 address_map.remove(&address);
+//             }
+//         }
+//     }
+// }
+
+// We only use Mutexes here because the interface forces us into `&self`.
+pub struct UdpMuxWriterHandle {
+    registration_channel: futures::lock::Mutex<flume::Sender<(UDPMuxConn, SocketAddr)>>,
+    send_channel: futures::lock::Mutex<
+        flume::Sender<(Vec<u8>, SocketAddr, oneshot::Sender<Result<usize, Error>>)>,
+    >,
+}
+
+#[async_trait]
+impl UDPMuxWriter for UdpMuxWriterHandle {
     async fn register_conn_for_address(&self, conn: &UDPMuxConn, addr: SocketAddr) {
-        if self.is_closed() {
-            return;
-        }
-
-        let key = conn.key();
+        match self
+            .registration_channel
+            .lock()
+            .await
+            .send((conn.to_owned(), addr))
         {
-            let mut addresses = self.address_map.write();
+            Ok(()) => {}
+            Err(flume::SendError(_unsent_item)) => {
+                return; // SendError only occurs if the channel is closed
+            }
+        };
 
-            addresses
-                .entry(addr)
-                .and_modify(|e| {
-                    if e.key() != key {
-                        e.remove_address(&addr);
-                        *e = conn.clone();
-                    }
-                })
-                .or_insert_with(|| conn.clone());
-        }
-
-        // remove addr from new_addrs once conn is established
-        {
-            let mut new_addrs = self.new_addrs.write();
-            new_addrs.remove(&addr);
-        }
-
-        log::debug!("Registered {} for {}", addr, key);
+        log::debug!("Registered {} for {}", addr, conn.key());
     }
 
     async fn send_to(&self, buf: &[u8], target: &SocketAddr) -> Result<usize, Error> {
-        self.udp_sock
-            .send_to(buf, *target)
+        let (response_sender, response_receiver) = oneshot::channel();
+
+        self.send_channel
+            .lock()
             .await
-            .map_err(Into::into)
+            .send((buf.to_owned(), target.to_owned(), response_sender))
+            .expect("TODO");
+
+        response_receiver.await.expect("TODO")
     }
 }
 

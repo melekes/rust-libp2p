@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::{
-    future::{FutureExt, join},
+    future::{join, FutureExt},
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     stream::StreamExt,
 };
@@ -108,7 +108,10 @@ async fn smoke() -> Result<()> {
 
     let pair = join(a.next(), b.next());
     match pair.await {
-        (Some(SwarmEvent::ConnectionEstablished { .. }), Some(SwarmEvent::ConnectionEstablished { .. })) => {}
+        (
+            Some(SwarmEvent::ConnectionEstablished { .. }),
+            Some(SwarmEvent::ConnectionEstablished { .. }),
+        ) => {}
         e => panic!("{:?}", e),
     };
 

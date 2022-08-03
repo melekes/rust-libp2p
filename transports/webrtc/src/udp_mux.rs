@@ -31,6 +31,7 @@ use tokio_crate as tokio;
 use webrtc_ice::udp_mux::{UDPMux, UDPMuxConn, UDPMuxConnParams, UDPMuxWriter};
 use webrtc_util::{Conn, Error};
 
+use crate::req_res_chan;
 use futures::channel::{mpsc, oneshot};
 use futures_lite::StreamExt;
 use std::{
@@ -79,8 +80,11 @@ pub struct UDPMuxNewAddr {
     /// `true` when UDP mux is closed.
     is_closed: AtomicBool,
 
-    registration_receiver: mpsc::Receiver<(UDPMuxConn, SocketAddr)>,
-    send_receiver: mpsc::Receiver<(Vec<u8>, SocketAddr, oneshot::Sender<Result<usize, Error>>)>,
+    close_command: req_res_chan::Receiver<(), Result<(), Error>>,
+    get_conn_command: req_res_chan::Receiver<String, Result<Arc<dyn Conn + Send + Sync>, Error>>,
+    remove_conn_command: req_res_chan::Receiver<String, ()>,
+    registration_command: req_res_chan::Receiver<(UDPMuxConn, SocketAddr), ()>,
+    send_command: req_res_chan::Receiver<(Vec<u8>, SocketAddr), Result<usize, Error>>,
 
     udp_mux_handle: Arc<UdpMuxHandle>,
     udp_mux_writer_handle: Arc<UdpMuxWriterHandle>,
@@ -89,8 +93,9 @@ pub struct UDPMuxNewAddr {
 impl UDPMuxNewAddr {
     /// Creates a new UDP muxer.
     pub fn new(udp_sock: UdpSocket) -> Self {
-        let (registration_sender, registration_receiver) = mpsc::channel(1);
-        let (send_sender, send_receiver) = mpsc::channel(1);
+        let (udp_mux_handle, close_command, get_conn_command, remove_conn_command) =
+            UdpMuxHandle::new();
+        let (udp_mux_writer_handle, registration_command, send_command) = UdpMuxWriterHandle::new();
 
         Self {
             udp_sock,
@@ -98,17 +103,13 @@ impl UDPMuxNewAddr {
             address_map: HashMap::default(),
             new_addrs: HashSet::default(),
             is_closed: AtomicBool::new(false),
-            registration_receiver,
-            send_receiver,
-            udp_mux_handle: Arc::new(UdpMuxHandle {
-                close_sender: todo!(),
-                get_conn_sender: todo!(),
-                remove_sender: todo!(),
-            }),
-            udp_mux_writer_handle: Arc::new(UdpMuxWriterHandle {
-                registration_channel: futures::lock::Mutex::new(registration_sender),
-                send_channel: futures::lock::Mutex::new(send_sender),
-            }),
+            close_command,
+            get_conn_command,
+            remove_conn_command,
+            registration_command,
+            send_command,
+            udp_mux_handle: Arc::new(udp_mux_handle),
+            udp_mux_writer_handle: Arc::new(udp_mux_writer_handle),
         }
     }
 
@@ -160,7 +161,9 @@ impl UDPMuxNewAddr {
         let mut read = ReadBuf::new(&mut recv_buf);
 
         loop {
-            while let Poll::Ready(Some((conn, addr))) = self.registration_receiver.poll_next(cx) {
+            while let Poll::Ready(Some(((conn, addr), response))) =
+                self.registration_command.poll_next(cx)
+            {
                 let key = conn.key();
 
                 self.address_map
@@ -175,6 +178,8 @@ impl UDPMuxNewAddr {
 
                 // remove addr from new_addrs once conn is established
                 self.new_addrs.remove(&addr);
+
+                let _ = response.send(());
             }
 
             match ready!(self.udp_sock.poll_recv_from(cx, &mut read)) {
@@ -248,42 +253,47 @@ fn write_packet_to_conn_from_addr(conn: UDPMuxConn, packet: Vec<u8>, addr: Socke
 }
 
 pub struct UdpMuxHandle {
-    close_sender: futures::lock::Mutex<mpsc::Sender<oneshot::Sender<Result<(), Error>>>>,
+    close_sender: futures::lock::Mutex<req_res_chan::Sender<(), Result<(), Error>>>,
     get_conn_sender: futures::lock::Mutex<
-        mpsc::Sender<(
-            String,
-            oneshot::Sender<Result<Arc<dyn Conn + Send + Sync>, Error>>,
-        )>,
+        req_res_chan::Sender<String, Result<Arc<dyn Conn + Send + Sync>, Error>>,
     >,
-    remove_sender: futures::lock::Mutex<mpsc::Sender<String>>,
+    remove_sender: futures::lock::Mutex<req_res_chan::Sender<String, ()>>,
+}
+
+impl UdpMuxHandle {
+    pub fn new() -> (
+        Self,
+        req_res_chan::Receiver<(), Result<(), Error>>,
+        req_res_chan::Receiver<String, Result<Arc<dyn Conn + Send + Sync>, Error>>,
+        req_res_chan::Receiver<String, ()>,
+    ) {
+        let (sender1, receiver1) = req_res_chan::new(1);
+        let (sender2, receiver2) = req_res_chan::new(1);
+        let (sender3, receiver3) = req_res_chan::new(1);
+
+        let this = Self {
+            close_sender: futures::lock::Mutex::new(sender1),
+            get_conn_sender: futures::lock::Mutex::new(sender2),
+            remove_sender: futures::lock::Mutex::new(sender3),
+        };
+
+        (this, receiver1, receiver2, receiver3)
+    }
 }
 
 #[async_trait]
 impl UDPMux for UdpMuxHandle {
     async fn close(&self) -> Result<(), Error> {
-        let (response_sender, response_receiver) = oneshot::channel();
-
-        self.close_sender
-            .lock()
-            .await
-            .send(response_sender)
-            .await
-            .expect("TODO");
-
-        response_receiver.await.expect("TODO")
+        self.close_sender.lock().await.send(()).await.expect("TODO")
     }
 
     async fn get_conn(self: Arc<Self>, ufrag: &str) -> Result<Arc<dyn Conn + Send + Sync>, Error> {
-        let (response_sender, response_receiver) = oneshot::channel();
-
         self.get_conn_sender
             .lock()
             .await
-            .send((ufrag.to_owned(), response_sender))
+            .send(ufrag.to_owned())
             .await
-            .expect("TODO");
-
-        response_receiver.await.expect("TODO")
+            .expect("TODO")
     }
 
     async fn remove_conn_by_ufrag(&self, ufrag: &str) {
@@ -383,10 +393,27 @@ impl UDPMux for UdpMuxHandle {
 // }
 
 pub struct UdpMuxWriterHandle {
-    registration_channel: futures::lock::Mutex<mpsc::Sender<(UDPMuxConn, SocketAddr)>>,
-    send_channel: futures::lock::Mutex<
-        mpsc::Sender<(Vec<u8>, SocketAddr, oneshot::Sender<Result<usize, Error>>)>,
-    >,
+    registration_channel: futures::lock::Mutex<req_res_chan::Sender<(UDPMuxConn, SocketAddr), ()>>,
+    send_channel:
+        futures::lock::Mutex<req_res_chan::Sender<(Vec<u8>, SocketAddr), Result<usize, Error>>>,
+}
+
+impl UdpMuxWriterHandle {
+    fn new() -> (
+        Self,
+        req_res_chan::Receiver<(UDPMuxConn, SocketAddr), ()>,
+        req_res_chan::Receiver<(Vec<u8>, SocketAddr), Result<usize, Error>>,
+    ) {
+        let (sender1, receiver1) = req_res_chan::new(1);
+        let (sender2, receiver2) = req_res_chan::new(1);
+
+        let this = Self {
+            registration_channel: futures::lock::Mutex::new(sender1),
+            send_channel: futures::lock::Mutex::new(sender2),
+        };
+
+        (this, receiver1, receiver2)
+    }
 }
 
 #[async_trait]
@@ -410,16 +437,12 @@ impl UDPMuxWriter for UdpMuxWriterHandle {
     }
 
     async fn send_to(&self, buf: &[u8], target: &SocketAddr) -> Result<usize, Error> {
-        let (response_sender, response_receiver) = oneshot::channel();
-
         self.send_channel
             .lock()
             .await
-            .send((buf.to_owned(), target.to_owned(), response_sender))
+            .send((buf.to_owned(), target.to_owned()))
             .await
-            .expect("TODO");
-
-        response_receiver.await.expect("TODO")
+            .expect("TODO")
     }
 }
 

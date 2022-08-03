@@ -253,11 +253,9 @@ fn write_packet_to_conn_from_addr(conn: UDPMuxConn, packet: Vec<u8>, addr: Socke
 }
 
 pub struct UdpMuxHandle {
-    close_sender: futures::lock::Mutex<req_res_chan::Sender<(), Result<(), Error>>>,
-    get_conn_sender: futures::lock::Mutex<
-        req_res_chan::Sender<String, Result<Arc<dyn Conn + Send + Sync>, Error>>,
-    >,
-    remove_sender: futures::lock::Mutex<req_res_chan::Sender<String, ()>>,
+    close_sender: req_res_chan::Sender<(), Result<(), Error>>,
+    get_conn_sender: req_res_chan::Sender<String, Result<Arc<dyn Conn + Send + Sync>, Error>>,
+    remove_sender: req_res_chan::Sender<String, ()>,
 }
 
 impl UdpMuxHandle {
@@ -272,9 +270,9 @@ impl UdpMuxHandle {
         let (sender3, receiver3) = req_res_chan::new(1);
 
         let this = Self {
-            close_sender: futures::lock::Mutex::new(sender1),
-            get_conn_sender: futures::lock::Mutex::new(sender2),
-            remove_sender: futures::lock::Mutex::new(sender3),
+            close_sender: sender1,
+            get_conn_sender: sender2,
+            remove_sender: sender3,
         };
 
         (this, receiver1, receiver2, receiver3)
@@ -284,13 +282,11 @@ impl UdpMuxHandle {
 #[async_trait]
 impl UDPMux for UdpMuxHandle {
     async fn close(&self) -> Result<(), Error> {
-        self.close_sender.lock().await.send(()).await.expect("TODO")
+        self.close_sender.send(()).await.expect("TODO")
     }
 
     async fn get_conn(self: Arc<Self>, ufrag: &str) -> Result<Arc<dyn Conn + Send + Sync>, Error> {
         self.get_conn_sender
-            .lock()
-            .await
             .send(ufrag.to_owned())
             .await
             .expect("TODO")
@@ -298,8 +294,6 @@ impl UDPMux for UdpMuxHandle {
 
     async fn remove_conn_by_ufrag(&self, ufrag: &str) {
         self.remove_sender
-            .lock()
-            .await
             .send(ufrag.to_owned())
             .await
             .expect("TODO")

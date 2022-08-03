@@ -8,18 +8,25 @@ use std::task::{Context, Poll};
 pub fn new<Req, Res>(capacity: usize) -> (Sender<Req, Res>, Receiver<Req, Res>) {
     let (sender, receiver) = mpsc::channel(capacity);
 
-    (Sender { inner: sender }, Receiver { inner: receiver })
+    (
+        Sender {
+            inner: futures::lock::Mutex::new(sender),
+        },
+        Receiver { inner: receiver },
+    )
 }
 
 pub struct Sender<Req, Res> {
-    inner: mpsc::Sender<(Req, oneshot::Sender<Res>)>,
+    inner: futures::lock::Mutex<mpsc::Sender<(Req, oneshot::Sender<Res>)>>,
 }
 
 impl<Req, Res> Sender<Req, Res> {
-    pub async fn send(&mut self, req: Req) -> io::Result<Res> {
+    pub async fn send(&self, req: Req) -> io::Result<Res> {
         let (sender, receiver) = oneshot::channel();
 
         self.inner
+            .lock()
+            .await
             .send((req, sender))
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;

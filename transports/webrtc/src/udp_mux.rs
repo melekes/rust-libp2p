@@ -36,8 +36,6 @@ use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use std::collections::VecDeque;
-use std::future::Future;
-use std::pin::Pin;
 use std::{
     collections::{HashMap, HashSet},
     io::ErrorKind,
@@ -48,7 +46,6 @@ use std::{
     },
     task::{Context, Poll},
 };
-use tokio_crate::sync::watch;
 
 const RECEIVE_MTU: usize = 8192;
 
@@ -159,7 +156,7 @@ impl UDPMuxNewAddr {
 
     /// Returns true if the UDP muxer is closed.
     pub fn is_closed(&self) -> bool {
-        return self.is_closed.load(Ordering::Relaxed);
+        self.is_closed.load(Ordering::Relaxed)
     }
 
     /// Reads from the underlying UDP socket and either reports a new address or proxies data to the
@@ -223,7 +220,7 @@ impl UDPMuxNewAddr {
                     })
                 });
 
-                self.conns.insert(ufrag.into(), muxed_conn.clone());
+                self.conns.insert(ufrag, muxed_conn.clone());
 
                 let _ = response.send(Ok(Arc::new(muxed_conn) as Arc<dyn Conn + Send + Sync>));
 
@@ -302,8 +299,8 @@ impl UDPMuxNewAddr {
                 }
             }
 
-            while let Poll::Ready(_) = self.close_futures.poll_next_unpin(cx) {}
-            while let Poll::Ready(_) = self.write_futures.poll_next_unpin(cx) {}
+            while self.close_futures.poll_next_unpin(cx).is_ready() {}
+            while self.write_futures.poll_next_unpin(cx).is_ready() {}
 
             match ready!(self.udp_sock.poll_recv_from(cx, &mut read)) {
                 Ok(addr) => {
@@ -314,7 +311,7 @@ impl UDPMuxNewAddr {
                         // If we couldn't find the connection based on source address, see if
                         // this is a STUN mesage and if so if we can find the connection based on ufrag.
                         None if is_stun_message(read.filled()) => {
-                            self.conn_from_stun_message(&read.filled(), &addr)
+                            self.conn_from_stun_message(read.filled(), &addr)
                         }
                         Some(s) => Some(s.to_owned()),
                         _ => None,

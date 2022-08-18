@@ -267,40 +267,34 @@ impl UDPMuxNewAddr {
                 continue;
             }
 
-            loop {
-                if let Some((buf, target, response)) = self.send_buffer.pop_front() {
+            if let Some((buf, target, response)) = self.send_buffer.pop_front() {
+                match self.udp_sock.poll_send_to(cx, &buf, target) {
+                    Poll::Ready(result) => {
+                        let _ = response.send(result.map_err(|e| Error::Io(e.into())));
+                        continue;
+                    }
+                    Poll::Pending => {
+                        self.send_buffer.push_back((buf, target, response));
+                    }
+                }
+            } else {
+                if let Poll::Ready(Some(((buf, target), response))) =
+                    self.send_command.poll_next(cx)
+                {
                     match self.udp_sock.poll_send_to(cx, &buf, target) {
                         Poll::Ready(result) => {
                             let _ = response.send(result.map_err(|e| Error::Io(e.into())));
+                            continue;
                         }
                         Poll::Pending => {
                             self.send_buffer.push_back((buf, target, response));
-                            break;
                         }
                     }
                 }
             }
 
-            if self.send_buffer.is_empty() {
-                loop {
-                    if let Poll::Ready(Some(((buf, target), response))) =
-                        self.send_command.poll_next(cx)
-                    {
-                        match self.udp_sock.poll_send_to(cx, &buf, target) {
-                            Poll::Ready(result) => {
-                                let _ = response.send(result.map_err(|e| Error::Io(e.into())));
-                            }
-                            Poll::Pending => {
-                                self.send_buffer.push_back((buf, target, response));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            while self.close_futures.poll_next_unpin(cx).is_ready() {}
-            while self.write_futures.poll_next_unpin(cx).is_ready() {}
+            let _ = self.close_futures.poll_next_unpin(cx);
+            let _ = self.write_futures.poll_next_unpin(cx);
 
             match ready!(self.udp_sock.poll_recv_from(cx, &mut read)) {
                 Ok(addr) => {

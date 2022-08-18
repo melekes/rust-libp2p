@@ -32,6 +32,8 @@ use webrtc_ice::udp_mux::{UDPMux, UDPMuxConn, UDPMuxConnParams, UDPMuxWriter};
 use webrtc_util::{Conn, Error};
 
 use crate::req_res_chan;
+use futures::channel::oneshot;
+use std::collections::VecDeque;
 use std::{
     collections::{HashMap, HashSet},
     io::ErrorKind,
@@ -78,6 +80,8 @@ pub struct UDPMuxNewAddr {
     /// `true` when UDP mux is closed.
     is_closed: AtomicBool,
 
+    send_buffer: VecDeque<(Vec<u8>, SocketAddr, oneshot::Sender<Result<usize, Error>>)>,
+
     close_command: req_res_chan::Receiver<(), Result<(), Error>>,
     get_conn_command: req_res_chan::Receiver<String, Result<Arc<dyn Conn + Send + Sync>, Error>>,
     remove_conn_command: req_res_chan::Receiver<String, ()>,
@@ -101,6 +105,7 @@ impl UDPMuxNewAddr {
             address_map: HashMap::default(),
             new_addrs: HashSet::default(),
             is_closed: AtomicBool::new(false),
+            send_buffer: VecDeque::default(),
             close_command,
             get_conn_command,
             remove_conn_command,
@@ -258,10 +263,36 @@ impl UDPMuxNewAddr {
                 continue;
             }
 
-            if let Poll::Ready(Some(((buf, target), response))) = self.send_command.poll_next(cx) {
-                // self.udp_sock
-                //     .poll_send_to(&buf, target)
-                todo!()
+            loop {
+                if let Some((buf, target, response)) = self.send_buffer.pop_front() {
+                    match self.udp_sock.poll_send_to(cx, &buf, target) {
+                        Poll::Ready(result) => {
+                            let _ = response.send(result.map_err(|e| Error::Io(e.into())));
+                        }
+                        Poll::Pending => {
+                            self.send_buffer.push_back((buf, target, response));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if self.send_buffer.is_empty() {
+                loop {
+                    if let Poll::Ready(Some(((buf, target), response))) =
+                        self.send_command.poll_next(cx)
+                    {
+                        match self.udp_sock.poll_send_to(cx, &buf, target) {
+                            Poll::Ready(result) => {
+                                let _ = response.send(result.map_err(|e| Error::Io(e.into())));
+                            }
+                            Poll::Pending => {
+                                self.send_buffer.push_back((buf, target, response));
+                                break;
+                            }
+                        }
+                    }
+                }
             }
 
             match ready!(self.udp_sock.poll_recv_from(cx, &mut read)) {

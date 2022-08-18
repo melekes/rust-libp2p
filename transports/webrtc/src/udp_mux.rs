@@ -21,7 +21,7 @@
 // SOFTWARE.
 
 use async_trait::async_trait;
-use futures::{ready, StreamExt};
+use futures::StreamExt;
 use stun::{
     attributes::ATTR_USERNAME,
     message::{is_message as is_stun_message, Message as STUNMessage},
@@ -296,8 +296,8 @@ impl UDPMuxNewAddr {
             let _ = self.close_futures.poll_next_unpin(cx);
             let _ = self.write_futures.poll_next_unpin(cx);
 
-            match ready!(self.udp_sock.poll_recv_from(cx, &mut read)) {
-                Ok(addr) => {
+            match self.udp_sock.poll_recv_from(cx, &mut read) {
+                Poll::Ready(Ok(addr)) => {
                     // Find connection based on previously having seen this source address
                     let conn = self.address_map.get(&addr);
 
@@ -347,13 +347,18 @@ impl UDPMuxNewAddr {
                             }));
                         }
                     }
+
+                    continue;
                 }
-                Err(err) if err.kind() == ErrorKind::TimedOut => {}
-                Err(err) => {
+                Poll::Ready(Err(err)) if err.kind() == ErrorKind::TimedOut => {}
+                Poll::Pending => {}
+                Poll::Ready(Err(err)) => {
                     log::error!("Could not read udp packet: {}", err);
                     return Poll::Ready(UDPMuxEvent::Error(err));
                 }
             }
+
+            return Poll::Pending;
         }
     }
 }

@@ -21,7 +21,7 @@
 // SOFTWARE.
 
 use async_trait::async_trait;
-use futures::ready;
+use futures::{ready, StreamExt};
 use stun::{
     attributes::ATTR_USERNAME,
     message::{is_message as is_stun_message, Message as STUNMessage},
@@ -33,7 +33,11 @@ use webrtc_util::{Conn, Error};
 
 use crate::req_res_chan;
 use futures::channel::oneshot;
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::{
     collections::{HashMap, HashSet},
     io::ErrorKind,
@@ -44,6 +48,7 @@ use std::{
     },
     task::{Context, Poll},
 };
+use tokio_crate::sync::watch;
 
 const RECEIVE_MTU: usize = 8192;
 
@@ -82,6 +87,8 @@ pub struct UDPMuxNewAddr {
 
     send_buffer: VecDeque<(Vec<u8>, SocketAddr, oneshot::Sender<Result<usize, Error>>)>,
 
+    close_futures: FuturesUnordered<BoxFuture<'static, ()>>,
+
     close_command: req_res_chan::Receiver<(), Result<(), Error>>,
     get_conn_command: req_res_chan::Receiver<String, Result<Arc<dyn Conn + Send + Sync>, Error>>,
     remove_conn_command: req_res_chan::Receiver<String, ()>,
@@ -106,6 +113,7 @@ impl UDPMuxNewAddr {
             new_addrs: HashSet::default(),
             is_closed: AtomicBool::new(false),
             send_buffer: VecDeque::default(),
+            close_futures: FuturesUnordered::default(),
             close_command,
             get_conn_command,
             remove_conn_command,
@@ -202,18 +210,15 @@ impl UDPMuxNewAddr {
                     }
                 };
                 let mut close_rx = muxed_conn.close_rx();
-                let this = self.udp_mux_handle.clone();
 
-                // TODO: Get rid of this spawn by creating a future that polls the close_rx and outputs the ufrag.
-                // Stuff that futures into a `FuturesUnordered` and poll it as part of this function
-                tokio::spawn({
+                self.close_futures.push({
                     let ufrag = ufrag.clone();
+                    let udp_mux_handle = self.udp_mux_handle.clone();
 
-                    async move {
+                    Box::pin(async move {
                         let _ = close_rx.changed().await;
-
-                        this.remove_conn_by_ufrag(&ufrag).await;
-                    }
+                        udp_mux_handle.remove_conn_by_ufrag(&ufrag).await;
+                    })
                 });
 
                 self.conns.insert(ufrag.into(), muxed_conn.clone());
@@ -294,6 +299,8 @@ impl UDPMuxNewAddr {
                     }
                 }
             }
+
+            while let Poll::Ready(_) = self.close_futures.poll_next_unpin(cx) {}
 
             match ready!(self.udp_sock.poll_recv_from(cx, &mut read)) {
                 Ok(addr) => {

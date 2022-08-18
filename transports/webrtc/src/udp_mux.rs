@@ -88,6 +88,7 @@ pub struct UDPMuxNewAddr {
     send_buffer: VecDeque<(Vec<u8>, SocketAddr, oneshot::Sender<Result<usize, Error>>)>,
 
     close_futures: FuturesUnordered<BoxFuture<'static, ()>>,
+    write_futures: FuturesUnordered<BoxFuture<'static, ()>>,
 
     close_command: req_res_chan::Receiver<(), Result<(), Error>>,
     get_conn_command: req_res_chan::Receiver<String, Result<Arc<dyn Conn + Send + Sync>, Error>>,
@@ -114,6 +115,7 @@ impl UDPMuxNewAddr {
             is_closed: AtomicBool::new(false),
             send_buffer: VecDeque::default(),
             close_futures: FuturesUnordered::default(),
+            write_futures: FuturesUnordered::default(),
             close_command,
             get_conn_command,
             remove_conn_command,
@@ -301,6 +303,7 @@ impl UDPMuxNewAddr {
             }
 
             while let Poll::Ready(_) = self.close_futures.poll_next_unpin(cx) {}
+            while let Poll::Ready(_) = self.write_futures.poll_next_unpin(cx) {}
 
             match ready!(self.udp_sock.poll_recv_from(cx, &mut read)) {
                 Ok(addr) => {
@@ -346,7 +349,11 @@ impl UDPMuxNewAddr {
                         Some(conn) => {
                             let mut packet = vec![0u8; read.filled().len()];
                             packet.copy_from_slice(read.filled());
-                            write_packet_to_conn_from_addr(conn, packet, addr);
+                            self.write_futures.push(Box::pin(async move {
+                                if let Err(err) = conn.write_packet(&packet, addr).await {
+                                    log::error!("Failed to write packet: {} (addr={})", err, addr);
+                                }
+                            }));
                         }
                     }
                 }
@@ -358,18 +365,6 @@ impl UDPMuxNewAddr {
             }
         }
     }
-}
-
-fn write_packet_to_conn_from_addr(conn: UDPMuxConn, packet: Vec<u8>, addr: SocketAddr) {
-    // Writing the packet should be quick given it just buffers the data (no actual IO).
-    //
-    // Block until completion instead of spawning to provide backpressure to the clients.
-    // NOTE: `block_on` could be removed once/if `write_packet` becomes sync.
-    futures::executor::block_on(async move {
-        if let Err(err) = conn.write_packet(&packet, addr).await {
-            log::error!("Failed to write packet: {} (addr={})", err, addr);
-        }
-    });
 }
 
 pub struct UdpMuxHandle {

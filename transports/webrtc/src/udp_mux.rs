@@ -28,8 +28,8 @@ use stun::{
 };
 use tokio::{io::ReadBuf, net::UdpSocket};
 use tokio_crate as tokio;
-use webrtc_ice::udp_mux::{UDPMux, UDPMuxConn, UDPMuxConnParams, UDPMuxWriter};
-use webrtc_util::{Conn, Error};
+use webrtc::ice::udp_mux::{UDPMux, UDPMuxConn, UDPMuxConnParams, UDPMuxWriter};
+use webrtc::util::{Conn, Error};
 
 use crate::req_res_chan;
 use futures::channel::oneshot;

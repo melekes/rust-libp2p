@@ -38,9 +38,9 @@ use libp2p_core::{
 use libp2p_noise::{Keypair, NoiseConfig, NoiseError, RemoteIdentity, X25519Spec};
 use log::{debug, trace};
 use tokio_crate::net::UdpSocket;
+use webrtc::ice::udp_mux::UDPMux;
 use webrtc::peer_connection::certificate::RTCCertificate;
 use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc_ice::udp_mux::UDPMux;
 
 use std::{
     borrow::Cow,
@@ -187,7 +187,7 @@ impl Transport for WebRTCTransport {
             .await?;
 
             // Open a data channel to do Noise on top and verify the remote.
-            let data_channel = conn.create_initial_upgrade_data_channel(false).await?;
+            let data_channel = conn.create_initial_upgrade_data_channel().await?;
 
             trace!("noise handshake with addr={}", remote);
             let peer_id = perform_noise_handshake_outbound(
@@ -577,8 +577,7 @@ async fn upgrade(
     .await?;
 
     // Open a data channel to do Noise on top and verify the remote.
-    // NOTE: channel is already negotiated by the client
-    let data_channel = conn.create_initial_upgrade_data_channel(true).await?;
+    let data_channel = conn.create_initial_upgrade_data_channel().await?;
 
     trace!(
         "noise handshake with addr={} (ufrag={})",

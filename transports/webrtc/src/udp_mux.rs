@@ -40,10 +40,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::ErrorKind,
     net::SocketAddr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -80,7 +77,7 @@ pub struct UDPMuxNewAddr {
     new_addrs: HashSet<SocketAddr>,
 
     /// `true` when UDP mux is closed.
-    is_closed: AtomicBool,
+    is_closed: bool,
 
     send_buffer: VecDeque<(Vec<u8>, SocketAddr, oneshot::Sender<Result<usize, Error>>)>,
 
@@ -109,7 +106,7 @@ impl UDPMuxNewAddr {
             conns: HashMap::default(),
             address_map: HashMap::default(),
             new_addrs: HashSet::default(),
-            is_closed: AtomicBool::new(false),
+            is_closed: false,
             send_buffer: VecDeque::default(),
             close_futures: FuturesUnordered::default(),
             write_future: OptionFuture::default(),
@@ -154,11 +151,6 @@ impl UDPMuxNewAddr {
         }
     }
 
-    /// Returns true if the UDP muxer is closed.
-    pub fn is_closed(&self) -> bool {
-        self.is_closed.load(Ordering::Relaxed)
-    }
-
     /// Reads from the underlying UDP socket and either reports a new address or proxies data to the
     /// muxed connection.
     pub fn poll(&mut self, cx: &mut Context) -> Poll<UDPMuxEvent> {
@@ -187,7 +179,7 @@ impl UDPMuxNewAddr {
             }
 
             if let Poll::Ready(Some((ufrag, response))) = self.get_conn_command.poll_next(cx) {
-                if self.is_closed() {
+                if self.is_closed {
                     let _ = response.send(Err(Error::ErrUseClosedNetworkConn));
                     continue;
                 }
@@ -224,7 +216,7 @@ impl UDPMuxNewAddr {
             }
 
             if let Poll::Ready(Some(((), response))) = self.close_command.poll_next(cx) {
-                if self.is_closed() {
+                if self.is_closed {
                     let _ = response.send(Err(Error::ErrAlreadyClosed));
                     continue;
                 }
@@ -243,7 +235,7 @@ impl UDPMuxNewAddr {
 
                 let _ = response.send(Ok(()));
 
-                self.is_closed.store(true, Ordering::SeqCst); // TODO: Added by Thomas, don't we need this?
+                self.is_closed = true; // TODO: Added by Thomas, don't we need this?
 
                 continue;
             }

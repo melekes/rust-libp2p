@@ -33,7 +33,7 @@ use webrtc_util::{Conn, Error};
 
 use crate::req_res_chan;
 use futures::channel::oneshot;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, FusedFuture, FutureExt, OptionFuture};
 use futures::stream::FuturesUnordered;
 use std::collections::VecDeque;
 use std::{
@@ -85,7 +85,7 @@ pub struct UDPMuxNewAddr {
     send_buffer: VecDeque<(Vec<u8>, SocketAddr, oneshot::Sender<Result<usize, Error>>)>,
 
     close_futures: FuturesUnordered<BoxFuture<'static, ()>>,
-    write_futures: FuturesUnordered<BoxFuture<'static, ()>>,
+    write_future: OptionFuture<BoxFuture<'static, ()>>,
 
     close_command: req_res_chan::Receiver<(), Result<(), Error>>,
     get_conn_command: req_res_chan::Receiver<String, Result<Arc<dyn Conn + Send + Sync>, Error>>,
@@ -112,7 +112,7 @@ impl UDPMuxNewAddr {
             is_closed: AtomicBool::new(false),
             send_buffer: VecDeque::default(),
             close_futures: FuturesUnordered::default(),
-            write_futures: FuturesUnordered::default(),
+            write_future: OptionFuture::default(),
             close_command,
             get_conn_command,
             remove_conn_command,
@@ -294,68 +294,81 @@ impl UDPMuxNewAddr {
             }
 
             let _ = self.close_futures.poll_next_unpin(cx);
-            let _ = self.write_futures.poll_next_unpin(cx);
 
-            match self.udp_sock.poll_recv_from(cx, &mut read) {
-                Poll::Ready(Ok(addr)) => {
-                    // Find connection based on previously having seen this source address
-                    let conn = self.address_map.get(&addr);
+            match self.write_future.poll_unpin(cx) {
+                Poll::Ready(Some(())) => {
+                    self.write_future = OptionFuture::default();
+                    continue;
+                }
+                Poll::Ready(None) => match self.udp_sock.poll_recv_from(cx, &mut read) {
+                    Poll::Ready(Ok(addr)) => {
+                        // Find connection based on previously having seen this source address
+                        let conn = self.address_map.get(&addr);
 
-                    let conn = match conn {
-                        // If we couldn't find the connection based on source address, see if
-                        // this is a STUN mesage and if so if we can find the connection based on ufrag.
-                        None if is_stun_message(read.filled()) => {
-                            self.conn_from_stun_message(read.filled(), &addr)
-                        }
-                        Some(s) => Some(s.to_owned()),
-                        _ => None,
-                    };
+                        let conn = match conn {
+                            // If we couldn't find the connection based on source address, see if
+                            // this is a STUN mesage and if so if we can find the connection based on ufrag.
+                            None if is_stun_message(read.filled()) => {
+                                self.conn_from_stun_message(read.filled(), &addr)
+                            }
+                            Some(s) => Some(s.to_owned()),
+                            _ => None,
+                        };
 
-                    match conn {
-                        None => {
-                            if !self.new_addrs.contains(&addr) {
-                                match ufrag_from_stun_message(read.filled(), false) {
-                                    Ok(ufrag) => {
-                                        log::trace!(
-                                            "Notifying about new address addr={} from ufrag={}",
-                                            &addr,
-                                            ufrag
-                                        );
-                                        self.new_addrs.insert(addr);
-                                        return Poll::Ready(UDPMuxEvent::NewAddr(NewAddr {
-                                            addr,
-                                            ufrag,
-                                        }));
-                                    }
-                                    Err(e) => {
-                                        log::debug!(
-                                            "Unknown address addr={} (non STUN packet: {})",
-                                            &addr,
-                                            e
-                                        );
+                        match conn {
+                            None => {
+                                if !self.new_addrs.contains(&addr) {
+                                    match ufrag_from_stun_message(read.filled(), false) {
+                                        Ok(ufrag) => {
+                                            log::trace!(
+                                                "Notifying about new address addr={} from ufrag={}",
+                                                &addr,
+                                                ufrag
+                                            );
+                                            self.new_addrs.insert(addr);
+                                            return Poll::Ready(UDPMuxEvent::NewAddr(NewAddr {
+                                                addr,
+                                                ufrag,
+                                            }));
+                                        }
+                                        Err(e) => {
+                                            log::debug!(
+                                                "Unknown address addr={} (non STUN packet: {})",
+                                                &addr,
+                                                e
+                                            );
+                                        }
                                     }
                                 }
                             }
+                            Some(conn) => {
+                                let mut packet = vec![0u8; read.filled().len()];
+                                packet.copy_from_slice(read.filled());
+                                self.write_future = OptionFuture::from(Some(
+                                    async move {
+                                        if let Err(err) = conn.write_packet(&packet, addr).await {
+                                            log::error!(
+                                                "Failed to write packet: {} (addr={})",
+                                                err,
+                                                addr
+                                            );
+                                        }
+                                    }
+                                    .boxed(),
+                                ));
+                            }
                         }
-                        Some(conn) => {
-                            let mut packet = vec![0u8; read.filled().len()];
-                            packet.copy_from_slice(read.filled());
-                            self.write_futures.push(Box::pin(async move {
-                                if let Err(err) = conn.write_packet(&packet, addr).await {
-                                    log::error!("Failed to write packet: {} (addr={})", err, addr);
-                                }
-                            }));
-                        }
-                    }
 
-                    continue;
-                }
-                Poll::Ready(Err(err)) if err.kind() == ErrorKind::TimedOut => {}
+                        continue;
+                    }
+                    Poll::Ready(Err(err)) if err.kind() == ErrorKind::TimedOut => {}
+                    Poll::Pending => {}
+                    Poll::Ready(Err(err)) => {
+                        log::error!("Could not read udp packet: {}", err);
+                        return Poll::Ready(UDPMuxEvent::Error(err));
+                    }
+                },
                 Poll::Pending => {}
-                Poll::Ready(Err(err)) => {
-                    log::error!("Could not read udp packet: {}", err);
-                    return Poll::Ready(UDPMuxEvent::Error(err));
-                }
             }
 
             return Poll::Pending;

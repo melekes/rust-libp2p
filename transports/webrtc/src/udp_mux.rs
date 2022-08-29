@@ -162,10 +162,6 @@ impl UDPMuxNewAddr {
     /// Reads from the underlying UDP socket and either reports a new address or proxies data to the
     /// muxed connection.
     pub fn poll(&mut self, cx: &mut Context) -> Poll<UDPMuxEvent> {
-        // TODO: avoid allocating the buffer each time.
-        let mut recv_buf = [0u8; RECEIVE_MTU];
-        let mut read = ReadBuf::new(&mut recv_buf);
-
         loop {
             if let Poll::Ready(Some(((conn, addr), response))) =
                 self.registration_command.poll_next(cx)
@@ -300,74 +296,80 @@ impl UDPMuxNewAddr {
                     self.write_future = OptionFuture::default();
                     continue;
                 }
-                Poll::Ready(None) => match self.udp_sock.poll_recv_from(cx, &mut read) {
-                    Poll::Ready(Ok(addr)) => {
-                        // Find connection based on previously having seen this source address
-                        let conn = self.address_map.get(&addr);
+                Poll::Ready(None) => {
+                    // TODO: avoid allocating the buffer each time.
+                    let mut recv_buf = [0u8; RECEIVE_MTU];
+                    let mut read = ReadBuf::new(&mut recv_buf);
 
-                        let conn = match conn {
-                            // If we couldn't find the connection based on source address, see if
-                            // this is a STUN mesage and if so if we can find the connection based on ufrag.
-                            None if is_stun_message(read.filled()) => {
-                                self.conn_from_stun_message(read.filled(), &addr)
-                            }
-                            Some(s) => Some(s.to_owned()),
-                            _ => None,
-                        };
+                    match self.udp_sock.poll_recv_from(cx, &mut read) {
+                        Poll::Ready(Ok(addr)) => {
+                            // Find connection based on previously having seen this source address
+                            let conn = self.address_map.get(&addr);
 
-                        match conn {
-                            None => {
-                                if !self.new_addrs.contains(&addr) {
-                                    match ufrag_from_stun_message(read.filled(), false) {
-                                        Ok(ufrag) => {
-                                            log::trace!(
+                            let conn = match conn {
+                                // If we couldn't find the connection based on source address, see if
+                                // this is a STUN mesage and if so if we can find the connection based on ufrag.
+                                None if is_stun_message(read.filled()) => {
+                                    self.conn_from_stun_message(read.filled(), &addr)
+                                }
+                                Some(s) => Some(s.to_owned()),
+                                _ => None,
+                            };
+
+                            match conn {
+                                None => {
+                                    if !self.new_addrs.contains(&addr) {
+                                        match ufrag_from_stun_message(read.filled(), false) {
+                                            Ok(ufrag) => {
+                                                log::trace!(
                                                 "Notifying about new address addr={} from ufrag={}",
                                                 &addr,
                                                 ufrag
                                             );
-                                            self.new_addrs.insert(addr);
-                                            return Poll::Ready(UDPMuxEvent::NewAddr(NewAddr {
-                                                addr,
-                                                ufrag,
-                                            }));
-                                        }
-                                        Err(e) => {
-                                            log::debug!(
-                                                "Unknown address addr={} (non STUN packet: {})",
-                                                &addr,
-                                                e
-                                            );
+                                                self.new_addrs.insert(addr);
+                                                return Poll::Ready(UDPMuxEvent::NewAddr(
+                                                    NewAddr { addr, ufrag },
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                log::debug!(
+                                                    "Unknown address addr={} (non STUN packet: {})",
+                                                    &addr,
+                                                    e
+                                                );
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            Some(conn) => {
-                                let mut packet = vec![0u8; read.filled().len()];
-                                packet.copy_from_slice(read.filled());
-                                self.write_future = OptionFuture::from(Some(
-                                    async move {
-                                        if let Err(err) = conn.write_packet(&packet, addr).await {
-                                            log::error!(
-                                                "Failed to write packet: {} (addr={})",
-                                                err,
-                                                addr
-                                            );
+                                Some(conn) => {
+                                    let mut packet = vec![0u8; read.filled().len()];
+                                    packet.copy_from_slice(read.filled());
+                                    self.write_future = OptionFuture::from(Some(
+                                        async move {
+                                            if let Err(err) = conn.write_packet(&packet, addr).await
+                                            {
+                                                log::error!(
+                                                    "Failed to write packet: {} (addr={})",
+                                                    err,
+                                                    addr
+                                                );
+                                            }
                                         }
-                                    }
-                                    .boxed(),
-                                ));
+                                        .boxed(),
+                                    ));
+                                }
                             }
-                        }
 
-                        continue;
+                            continue;
+                        }
+                        Poll::Ready(Err(err)) if err.kind() == ErrorKind::TimedOut => {}
+                        Poll::Pending => {}
+                        Poll::Ready(Err(err)) => {
+                            log::error!("Could not read udp packet: {}", err);
+                            return Poll::Ready(UDPMuxEvent::Error(err));
+                        }
                     }
-                    Poll::Ready(Err(err)) if err.kind() == ErrorKind::TimedOut => {}
-                    Poll::Pending => {}
-                    Poll::Ready(Err(err)) => {
-                        log::error!("Could not read udp packet: {}", err);
-                        return Poll::Ready(UDPMuxEvent::Error(err));
-                    }
-                },
+                }
                 Poll::Pending => {}
             }
 

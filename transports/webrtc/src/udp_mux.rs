@@ -406,21 +406,28 @@ impl UdpMuxHandle {
 #[async_trait]
 impl UDPMux for UdpMuxHandle {
     async fn close(&self) -> Result<(), Error> {
-        self.close_sender.send(()).await.expect("TODO")
+        self.close_sender
+            .send(())
+            .await
+            .map_err(|e| Error::Io(e.into()))??;
+
+        Ok(())
     }
 
     async fn get_conn(self: Arc<Self>, ufrag: &str) -> Result<Arc<dyn Conn + Send + Sync>, Error> {
-        self.get_conn_sender
+        let conn = self
+            .get_conn_sender
             .send(ufrag.to_owned())
             .await
-            .expect("TODO")
+            .map_err(|e| Error::Io(e.into()))??;
+
+        Ok(conn)
     }
 
     async fn remove_conn_by_ufrag(&self, ufrag: &str) {
-        self.remove_sender
-            .send(ufrag.to_owned())
-            .await
-            .expect("TODO")
+        if let Err(e) = self.remove_sender.send(ufrag.to_owned()).await {
+            log::debug!("Failed to send message through channel: {:?}", e);
+        }
     }
 }
 
@@ -450,19 +457,29 @@ impl UdpMuxWriterHandle {
 #[async_trait]
 impl UDPMuxWriter for UdpMuxWriterHandle {
     async fn register_conn_for_address(&self, conn: &UDPMuxConn, addr: SocketAddr) {
-        self.registration_channel
+        match self
+            .registration_channel
             .send((conn.to_owned(), addr))
             .await
-            .expect("TODO");
+        {
+            Ok(()) => {}
+            Err(e) => {
+                log::debug!("Failed to send message through channel: {:?}", e);
+                return;
+            }
+        }
 
         log::debug!("Registered {} for {}", addr, conn.key());
     }
 
     async fn send_to(&self, buf: &[u8], target: &SocketAddr) -> Result<usize, Error> {
-        self.send_channel
+        let bytes_written = self
+            .send_channel
             .send((buf.to_owned(), target.to_owned()))
             .await
-            .expect("TODO")
+            .map_err(|e| Error::Io(e.into()))??;
+
+        Ok(bytes_written)
     }
 }
 

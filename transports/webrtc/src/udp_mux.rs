@@ -33,6 +33,7 @@ use webrtc::util::{Conn, Error};
 
 use crate::req_res_chan;
 use futures::channel::oneshot;
+use futures::channel::oneshot::Sender;
 use futures::future::{BoxFuture, FutureExt, OptionFuture};
 use futures::stream::FuturesUnordered;
 use std::collections::VecDeque;
@@ -79,7 +80,7 @@ pub struct UDPMuxNewAddr {
     /// `true` when UDP mux is closed.
     is_closed: bool,
 
-    send_buffer: VecDeque<(Vec<u8>, SocketAddr, oneshot::Sender<Result<usize, Error>>)>,
+    send_buffer: Option<(Vec<u8>, SocketAddr, oneshot::Sender<Result<usize, Error>>)>,
 
     close_futures: FuturesUnordered<BoxFuture<'static, ()>>,
     write_future: OptionFuture<BoxFuture<'static, ()>>,
@@ -107,7 +108,7 @@ impl UDPMuxNewAddr {
             address_map: HashMap::default(),
             new_addrs: HashSet::default(),
             is_closed: false,
-            send_buffer: VecDeque::default(),
+            send_buffer: None,
             close_futures: FuturesUnordered::default(),
             write_future: OptionFuture::default(),
             close_command,
@@ -155,6 +156,28 @@ impl UDPMuxNewAddr {
     /// muxed connection.
     pub fn poll(&mut self, cx: &mut Context) -> Poll<UDPMuxEvent> {
         loop {
+            match self.send_buffer.take() {
+                None => {
+                    if let Poll::Ready(Some(((buf, target), response))) =
+                    self.send_command.poll_next(cx)
+                    {
+                        self.send_buffer = Some((buf, target, response));
+                        continue;
+                    }
+                }
+                Some((buf, target, response)) => {
+                    match self.udp_sock.poll_send_to(cx, &buf, target) {
+                        Poll::Ready(result) => {
+                            let _ = response.send(result.map_err(|e| Error::Io(e.into())));
+                            continue;
+                        }
+                        Poll::Pending => {
+                            self.send_buffer = Some((buf, target, response));
+                        }
+                    }
+                }
+            }
+
             if let Poll::Ready(Some(((conn, addr), response))) =
                 self.registration_command.poll_next(cx)
             {
@@ -253,32 +276,6 @@ impl UDPMuxNewAddr {
                 let _ = response.send(());
 
                 continue;
-            }
-
-            if let Some((buf, target, response)) = self.send_buffer.pop_front() {
-                match self.udp_sock.poll_send_to(cx, &buf, target) {
-                    Poll::Ready(result) => {
-                        let _ = response.send(result.map_err(|e| Error::Io(e.into())));
-                        continue;
-                    }
-                    Poll::Pending => {
-                        self.send_buffer.push_back((buf, target, response));
-                    }
-                }
-            } else {
-                if let Poll::Ready(Some(((buf, target), response))) =
-                    self.send_command.poll_next(cx)
-                {
-                    match self.udp_sock.poll_send_to(cx, &buf, target) {
-                        Poll::Ready(result) => {
-                            let _ = response.send(result.map_err(|e| Error::Io(e.into())));
-                            continue;
-                        }
-                        Poll::Pending => {
-                            self.send_buffer.push_back((buf, target, response));
-                        }
-                    }
-                }
             }
 
             let _ = self.close_futures.poll_next_unpin(cx);

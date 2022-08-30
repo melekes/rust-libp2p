@@ -159,7 +159,7 @@ impl UDPMuxNewAddr {
             match self.send_buffer.take() {
                 None => {
                     if let Poll::Ready(Some(((buf, target), response))) =
-                    self.send_command.poll_next(cx)
+                        self.send_command.poll_next(cx)
                     {
                         self.send_buffer = Some((buf, target, response));
                         continue;

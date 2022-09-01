@@ -33,10 +33,8 @@ use webrtc::util::{Conn, Error};
 
 use crate::req_res_chan;
 use futures::channel::oneshot;
-use futures::channel::oneshot::Sender;
 use futures::future::{BoxFuture, FutureExt, OptionFuture};
 use futures::stream::FuturesUnordered;
-use std::collections::VecDeque;
 use std::{
     collections::{HashMap, HashSet},
     io::ErrorKind,

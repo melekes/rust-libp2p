@@ -36,7 +36,6 @@ use webrtc::data_channel::RTCDataChannel;
 use webrtc::peer_connection::RTCPeerConnection;
 
 use std::{
-    pin::Pin,
     sync::{Arc, Mutex as StdMutex},
     task::{Context, Poll},
 };
@@ -191,7 +190,7 @@ impl StreamMuxer for Connection {
     fn poll_outbound(
         &self,
         cx: &mut Context<'_>,
-        s: &mut Self::OutboundSubstream,
+        _s: &mut Self::OutboundSubstream,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
         let mut inner = self.inner.lock().unwrap();
         let peer_conn = self.peer_conn.clone();
@@ -237,7 +236,7 @@ impl StreamMuxer for Connection {
         }
     }
 
-    fn destroy_outbound(&self, s: Self::OutboundSubstream) {
+    fn destroy_outbound(&self, _s: Self::OutboundSubstream) {
     }
 
     fn poll_close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {

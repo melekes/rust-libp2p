@@ -41,7 +41,7 @@ use crate::tokio::{
     error::Error,
     fingerprint::Fingerprint,
     udp_mux::{UDPMuxEvent, UDPMuxNewAddr},
-    upgrade,
+    upgrade, CertificateError,
 };
 
 /// A WebRTC transport with direct p2p communication (without a STUN server).
@@ -59,17 +59,22 @@ impl Transport {
     ///
     /// ```
     /// use libp2p_core::identity;
+    /// use webrtc::peer_connection::certificate::RTCCertificate;
+    /// use rand::distributions::DistString;
     /// use rand::thread_rng;
-    /// use libp2p_webrtc::tokio::{Transport, Certificate};
+    /// use libp2p_webrtc::tokio::{Certificate, Transport};
     ///
     /// let id_keys = identity::Keypair::generate_ed25519();
-    /// let transport = Transport::new(id_keys, Certificate::generate(&mut thread_rng()).unwrap());
+    ///
+    /// let transport = Transport::new(id_keys);
     /// ```
-    pub fn new(id_keys: identity::Keypair, certificate: Certificate) -> Self {
-        Self {
+    pub fn new(id_keys: identity::Keypair) -> Result<Self, CertificateError> {
+        let certificate = Certificate::new(&id_keys)?;
+
+        Ok(Self {
             config: Config::new(id_keys, certificate),
             listeners: SelectAll::new(),
-        }
+        })
     }
 }
 
@@ -241,8 +246,7 @@ impl ListenStream {
                     {
                         return Poll::Ready(TransportEvent::NewAddress {
                             listener_id: self.listener_id,
-                            listen_addr: self
-                                .listen_multiaddress(ip, self.config.id_keys.public().to_peer_id()),
+                            listen_addr: self.listen_multiaddress(ip),
                         });
                     }
                 }
@@ -253,8 +257,7 @@ impl ListenStream {
                     {
                         return Poll::Ready(TransportEvent::AddressExpired {
                             listener_id: self.listener_id,
-                            listen_addr: self
-                                .listen_multiaddress(ip, self.config.id_keys.public().to_peer_id()),
+                            listen_addr: self.listen_multiaddress(ip),
                         });
                     }
                 }
@@ -271,11 +274,10 @@ impl ListenStream {
     }
 
     /// Constructs a [`Multiaddr`] for the given IP address that represents our listen address.
-    fn listen_multiaddress(&self, ip: IpAddr, local_peer_id: PeerId) -> Multiaddr {
+    fn listen_multiaddress(&self, ip: IpAddr) -> Multiaddr {
         let socket_addr = SocketAddr::new(ip, self.listen_addr.port());
 
         socketaddr_to_multiaddr(&socket_addr, Some(self.config.fingerprint))
-            .with(Protocol::P2p(*local_peer_id.as_ref()))
     }
 }
 
@@ -431,7 +433,6 @@ mod tests {
     use super::*;
     use futures::future::poll_fn;
     use libp2p_core::{multiaddr::Protocol, Transport as _};
-    use rand::thread_rng;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
@@ -551,8 +552,7 @@ mod tests {
     #[tokio::test]
     async fn close_listener() {
         let id_keys = identity::Keypair::generate_ed25519();
-        let mut transport =
-            Transport::new(id_keys, Certificate::generate(&mut thread_rng()).unwrap());
+        let mut transport = Transport::new(id_keys).unwrap();
 
         assert!(poll_fn(|cx| Pin::new(&mut transport).as_mut().poll(cx))
             .now_or_never()
